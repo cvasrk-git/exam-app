@@ -14,13 +14,13 @@ openai_client = openai.AzureOpenAI(
     azure_endpoint="https://aique-m6xlx4yt-eastus2.openai.azure.com/",
 )
 
+
 @app.route("/get_questions", methods=["GET"])
 def get_questions():
-    technology = request.args.get("technology")  # Updated from subject
+    technology = request.args.get("technology")
     difficulty = request.args.get("difficulty")
     q_type = request.args.get("type")
 
-    # Validate required parameters
     if not technology or not difficulty or not q_type:
         return jsonify({"error": "Missing required parameters: technology, difficulty, or type"}), 400
 
@@ -31,8 +31,6 @@ def get_questions():
     - 'question' (question text)
     - 'options' (list of possible answers, if applicable)
     - 'correct_answer' (correct answer text).
-
-    Do NOT wrap the response in markdown or text formatting.
     """
 
     try:
@@ -44,19 +42,17 @@ def get_questions():
         )
 
         response_text = response.choices[0].message.content
-
-        # 🔹 Remove Markdown Code Block (```json ... ```)
         clean_json = re.sub(r"```json\n(.*?)\n```", r"\1", response_text, flags=re.DOTALL)
 
-        # 🔹 Convert JSON String to Python List
         try:
             questions_json = json.loads(clean_json)
-            if not isinstance(questions_json, list):  # Ensure it's a valid list
+            if not isinstance(questions_json, list):
                 raise ValueError("Generated response is not a valid list of questions.")
         except json.JSONDecodeError:
             return jsonify({"error": "Invalid JSON format received from OpenAI"}), 500
 
-        return jsonify({"difficulty": difficulty, "technology": technology, "type": q_type, "questions": questions_json})
+        return jsonify(
+            {"difficulty": difficulty, "technology": technology, "type": q_type, "questions": questions_json})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -66,35 +62,43 @@ def get_questions():
 def validate_answers():
     try:
         data = request.get_json()
-
-        # Ensure both 'answers' and 'questions' keys exist
         if not data or "answers" not in data or "questions" not in data:
             return jsonify({"error": "Invalid request. Expected 'answers' and 'questions' in JSON."}), 400
 
         answers = data["answers"]
-        questions = {str(q["id"]): q for q in data["questions"]}  # Convert to dictionary by ID
+        questions = {str(q["id"]): q for q in data["questions"]}
+        validation_results = []
+        correct_count = 0
 
-        validation_results = {}
-
-        for q_id, answer in answers.items():
+        for q_id, user_answer in answers.items():
             question_data = questions.get(q_id)
-
             if not question_data:
-                validation_results[q_id] = "Question not found"
+                validation_results.append({"id": q_id, "status": "Question not found", "correct": False})
                 continue
 
             correct_answer = question_data.get("correct_answer")
-            if not answer:  # Handle unanswered questions
-                validation_results[q_id] = "No answer selected"
-                continue
+            is_correct = str(user_answer).strip().lower() == str(correct_answer).strip().lower()
+            if is_correct:
+                correct_count += 1
 
-            # Simple validation without OpenAI
-            if str(answer).strip().lower() == str(correct_answer).strip().lower():
-                validation_results[q_id] = "Correct"
-            else:
-                validation_results[q_id] = "Incorrect"
+            validation_results.append({
+                "id": q_id,
+                "question": question_data["question"],
+                "user_answer": user_answer,
+                "correct_answer": correct_answer,
+                "status": "Correct" if is_correct else "Incorrect",
+                "accuracy": "100%" if is_correct else "0%"
+            })
 
-        return jsonify({"validation": validation_results})
+        total_questions = len(questions)
+        score_percentage = (correct_count / total_questions) * 100 if total_questions else 0
+        ranking = "Excellent" if score_percentage >= 80 else "Good" if score_percentage >= 50 else "Needs Improvement"
+
+        return jsonify({
+            "validation": validation_results,
+            "score": score_percentage,
+            "ranking": ranking
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
