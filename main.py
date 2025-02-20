@@ -3,15 +3,20 @@ from flask_cors import CORS
 import openai
 import json
 import re
+import os
+from dotenv import load_dotenv
 import time  # Import time module for tracking timestamps
 
 app = Flask(__name__)
 CORS(app)  # Allow React frontend to call API
 
-API_KEY = "API_KEY"
-API_ENDPOINT = "https://API_ENDPOINT.openai.azure.com/"
-DEPLOYMENT_NAME = "DEPLOYMENT_NAME"  # Your Azure OpenAI model deployment
-API_VERSION = "API_VERSION"
+# Load environment variables from .env file
+load_dotenv()
+
+API_KEY = os.getenv("API_KEY")
+API_ENDPOINT = os.getenv("API_ENDPOINT")
+DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME")  # Your Azure OpenAI model deployment
+API_VERSION = os.getenv("API_VERSION")
 
 # Configure Azure OpenAI
 openai_client = openai.AzureOpenAI(
