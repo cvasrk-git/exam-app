@@ -8,12 +8,18 @@ import time  # Import time module for tracking timestamps
 app = Flask(__name__)
 CORS(app)  # Allow React frontend to call API
 
+API_KEY = "API_KEY"
+API_ENDPOINT = "https://API_ENDPOINT.openai.azure.com/"
+DEPLOYMENT_NAME = "DEPLOYMENT_NAME"  # Your Azure OpenAI model deployment
+API_VERSION = "API_VERSION"
+
 # Configure Azure OpenAI
 openai_client = openai.AzureOpenAI(
-    api_key="260Bhbwr7C2u5IEHvNZXOf3EYYNqMGebapo9TjUg4rhcNAHzyVK6JQQJ99BBACHYHv6XJ3w3AAAAACOGCLay",
-    api_version="2024-05-01-preview",
-    azure_endpoint="https://aique-m6xlx4yt-eastus2.openai.azure.com/",
+    azure_endpoint=API_ENDPOINT,
+    api_key=API_KEY,
+    api_version=API_VERSION,
 )
+
 
 # Default time limit per question (in seconds)
 DEFAULT_TIME_LIMIT = 30
@@ -22,61 +28,69 @@ DEFAULT_TIME_LIMIT = 30
 question_start_times = {}
 
 
-@app.route("/get_questions", methods=["GET"])
-def get_questions():
-    technology = request.args.get("technology")
-    difficulty = request.args.get("difficulty")
-    q_type = request.args.get("type")
-    user_id = request.args.get("user_id")  # Unique user identifier
+@app.route("/generate_questions", methods=["POST"])
+def generate_questions():
+    """Generate exam questions based on user input prompt"""
+    data = request.json
+    prompt = data.get("prompt", "").strip()
+    user_id = data.get("user_id")
 
-    if not technology or not difficulty or not q_type or not user_id:
-        return jsonify({"error": "Missing required parameters: technology, difficulty, type, or user_id"}), 400
+    if not prompt:
+        return jsonify({"error": "Prompt is required"}), 400
 
-    prompt = f"""
-    Generate 5 {difficulty} level {q_type} questions for {technology}.
-    Each question should include:
-    - 'id' (unique question number)
-    - 'question' (question text)
-    - 'options' (list of possible answers, if applicable)
-    - 'correct_answer' (correct answer text)
-    - 'time_limit' (time allowed to answer in seconds, default {DEFAULT_TIME_LIMIT}s).
+    formatted_prompt = f"""
+    Generate a set of exam questions based on the prompt:
+    '{prompt}'
 
-    Return the response in JSON format as a list of dictionaries.
+    Each question must be a dictionary with:
+    - 'id': unique question ID
+    - 'question': question text
+    - 'type': one of ('mcq', 'true_false', 'short_answer', 'coding', 'essay')
+    - 'options': list of possible answers (only for 'mcq' and 'true_false')
+    - 'correct_answer': correct answer text (except for 'coding' and 'essay')
+    - 'time_limit': time in seconds (default {DEFAULT_TIME_LIMIT})
+
+    Format the response as a JSON array of question objects **without Markdown formatting**.
     """
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "system", "content": prompt}],
+            model=DEPLOYMENT_NAME,
+            messages=[{"role": "system", "content": formatted_prompt}],
             temperature=0.7,
-            max_tokens=500,
+            max_tokens=800,  # 🔹 Increased to avoid truncation
         )
 
-        response_text = response.choices[0].message.content
+        response_text = response.choices[0].message.content.strip()
+        print("\n✅ Raw Response:", response_text)  # Debugging
+
+        # 🔹 Remove potential Markdown ```json ... ``` wrapping
         clean_json = re.sub(r"```json\n(.*?)\n```", r"\1", response_text, flags=re.DOTALL)
 
         try:
-            questions_json = json.loads(clean_json)
+            questions_json = json.loads(clean_json)  # Convert string to JSON
             if not isinstance(questions_json, list):
-                raise ValueError("Generated response is not a valid list of questions.")
+                raise ValueError("Response is not a valid JSON list of questions.")
 
-            # Initialize time tracking for each question for this user
+            # ✅ Debug: Print parsed JSON
+            print("\n🔍 Parsed Questions JSON:", json.dumps(questions_json, indent=2))
+
+            # Initialize question timers
             question_start_times[user_id] = {}
 
             for question in questions_json:
-                question_id = str(question.get("id"))
-                question.setdefault("time_limit", DEFAULT_TIME_LIMIT)
-                question_start_times[user_id][question_id] = time.time()  # Store start time
+                question_id = str(question.get("id", ""))
+                question.setdefault("time_limit", DEFAULT_TIME_LIMIT)  # Ensure time_limit
+                question_start_times[user_id][question_id] = time.time()  # Start time
+
+                # ✅ Ensure options exist for MCQ
+                if question["type"] == "mcq" and not question.get("options"):
+                    question["options"] = ["Option A", "Option B", "Option C", "Option D"]
+
+            return jsonify({"questions": questions_json})
 
         except json.JSONDecodeError:
             return jsonify({"error": "Invalid JSON format received from OpenAI"}), 500
-
-        return jsonify({
-            "difficulty": difficulty,
-            "technology": technology,
-            "type": q_type,
-            "questions": questions_json
-        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
