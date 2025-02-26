@@ -68,6 +68,7 @@ def generate_questions():
     - 'type': one of ('mcq', 'true_false', 'short_answer', 'coding', 'essay')
     - 'options': list of possible answers (only for 'mcq' and 'true_false')
     - 'correct_answer': correct answer text (except for 'coding' and 'essay')
+    - 'hint': a short hint for the question
     - 'time_limit': time in seconds (default {DEFAULT_TIME_LIMIT})
 
     Format the response as a JSON array of question objects without Markdown formatting.
@@ -92,6 +93,7 @@ def generate_questions():
             question_start_times[user_id] = {}
             for question in questions_json:
                 question_id = str(question.get("id", ""))
+                question.setdefault("hint", "No hint available")  # Ensure hint is always present
                 question.setdefault("time_limit", DEFAULT_TIME_LIMIT)
                 question_start_times[user_id][question_id] = time.time()
 
