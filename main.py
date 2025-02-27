@@ -8,12 +8,20 @@ import time
 import uuid
 from dotenv import load_dotenv
 from azure.data.tables import TableServiceClient, UpdateMode
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, create_access_token
+import sqlite3
+from flask_jwt_extended import jwt_required, get_jwt_identity
 
 app = Flask(__name__)
 CORS(app)  # Allow React frontend to call API
 
 # Load environment variables from .env file
 load_dotenv()
+
+bcrypt = Bcrypt(app)
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
+jwt = JWTManager(app)
 
 # Azure OpenAI Configuration
 API_KEY = os.getenv("API_KEY")
@@ -23,6 +31,27 @@ API_VERSION = os.getenv("API_VERSION")
 
 # Azure Table Storage Configuration
 AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+
+# Database connection
+def get_db_connection():
+    conn = sqlite3.connect("users.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Create users table
+def create_users_table():
+    conn = get_db_connection()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+create_users_table()  # Ensure table exists on startup
 
 # Initialize Azure Table Service Client
 table_service_client = TableServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
@@ -47,6 +76,71 @@ openai_client = openai.AzureOpenAI(
 
 DEFAULT_TIME_LIMIT = 30  # Default question time limit in seconds
 question_start_times = {}  # Store question start times
+
+@app.route("/protected", methods=["GET"])
+@jwt_required()
+def protected():
+    current_user = get_jwt_identity()
+    return jsonify({"message": f"Welcome {current_user}!"})
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json()
+    email = data.get("email")
+    password = data.get("password")
+
+    conn = get_db_connection()
+    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    conn.close()
+
+    if user and bcrypt.check_password_hash(user["password"], password):
+        token = create_access_token(identity=email)
+        return jsonify({"token": token})
+    else:
+        return jsonify({"error": "Invalid credentials"}), 401
+
+# Database connection for exam results
+def get_results_db_connection():
+    conn = sqlite3.connect("exam_results.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Create results table
+def create_results_table():
+    conn = get_results_db_connection()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            score REAL NOT NULL,
+            grade TEXT NOT NULL,
+            status TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# Ensure the table is created on startup
+create_results_table()
+
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json()
+    email = data.get("email")
+    password = data.get("password")
+
+    hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
+
+    conn = get_db_connection()
+    try:
+        conn.execute("INSERT INTO users (email, password) VALUES (?, ?)", (email, hashed_password))
+        conn.commit()
+        return jsonify({"message": "User registered successfully!"})
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Email already exists"}), 400
+    finally:
+        conn.close()
 
 @app.route("/generate_questions", methods=["POST"])
 def generate_questions():
@@ -108,16 +202,15 @@ def generate_questions():
 
 @app.route("/validate_answers", methods=["POST"])
 def validate_answers():
-    """Validate user answers and store selected results in Azure Table Storage"""
+    """Validate user answers and store results in SQLite database"""
     try:
         data = request.get_json()
 
         # Validate request
-        if not data or "answers" not in data or "questions" not in data or "user_id" not in data or "name" not in data:
-            return jsonify({"error": "Invalid request. Expected 'user_id', 'name', 'answers', and 'questions'."}), 400
+        if not data or "answers" not in data or "questions" not in data or "user_id" not in data:
+            return jsonify({"error": "Invalid request. Expected 'user_id', 'answers', and 'questions'."}), 400
 
         user_id = data["user_id"]
-        student_name = data["name"]  # Capture student name
         answers = data["answers"]
         questions = {str(q["id"]): q for q in data["questions"]}  # Map questions by ID
 
@@ -131,7 +224,6 @@ def validate_answers():
             question_data = questions.get(q_id)
 
             if not question_data or "correct_answer" not in question_data:
-                print(f"⚠️ Skipping question {q_id} - No valid question data found")
                 continue
 
             correct_answer = question_data["correct_answer"]
@@ -142,9 +234,6 @@ def validate_answers():
 
             if normalized_user_answer == normalized_correct_answer:
                 correct_count += 1
-                print(f"✅ Correct Answer: {user_answer} (QID: {q_id})")
-            else:
-                print(f"❌ Incorrect Answer: {user_answer} (Expected: {correct_answer}, QID: {q_id})")
 
         # Score Calculation
         score_percentage = (correct_count / total_questions) * 100 if total_questions else 0
@@ -161,27 +250,20 @@ def validate_answers():
         # Assign Status
         status = "Passed" if score_percentage >= 50 else "Failed"
 
-        # Generate unique RowKey using UUID
-        unique_row_key = str(uuid.uuid4())  # Generate a new unique key
+        # Store results in SQLite
+        conn = get_results_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO results (user_id, score, grade, status)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, score_percentage, grade, status))
+        conn.commit()
+        conn.close()
 
-        # Store selected fields in Azure Table Storage
-        exam_result = {
-            "PartitionKey": "ExamResults",  # Ensure correct table name
-            "RowKey": unique_row_key,  # Unique identifier for each result
-            "UserID": user_id,
-            "StudentName": student_name,
-            "Score": score_percentage,
-            "Grade": grade,
-            "Status": status,
-        }
-
-        print(f"📝 Saving Exam Result: {exam_result}")  # Debugging log
-
-        table_client.upsert_entity(exam_result, mode=UpdateMode.REPLACE)  # Ensure a new row is added
-        print("✅ Exam result successfully saved!")
+        print("✅ Exam result successfully saved in SQLite!")
 
         return jsonify({
-            "StudentName": student_name,
+            "user_id": user_id,
             "Score": score_percentage,
             "Grade": grade,
             "Status": status
@@ -190,6 +272,40 @@ def validate_answers():
     except Exception as e:
         print(f"❌ Error saving exam result: {e}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/get_results", methods=["GET"])
+@jwt_required()
+def get_results():
+    """Retrieve exam results for the logged-in user"""
+    try:
+        user_id = get_jwt_identity()  # Get user ID from token
+
+        conn = get_results_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM results WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
+        results = cursor.fetchall()
+        conn.close()
+
+        if not results:
+            return jsonify({"message": "No results found for this user."}), 404
+
+        results_list = [
+            {
+                "userid": row["user_id"],
+                "score": row["score"],
+                "grade": row["grade"],
+                "status": row["status"],
+                "timestamp": row["timestamp"],
+            }
+            for row in results
+        ]
+
+        return jsonify({"results": results_list})
+
+    except Exception as e:
+        print(f"❌ Error retrieving exam results: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
