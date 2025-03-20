@@ -49,7 +49,7 @@ def get_db_connection(db_name: str = "users.db") -> sqlite3.Connection:
     return conn
 
 def init_databases():
-    """Initialize all required databases and tables"""
+    """Initialize all required database tables"""
     # Create exam_results.db
     conn = get_db_connection("exam_results.db")
     conn.execute("""
@@ -65,13 +65,25 @@ def init_databases():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.commit()
+
+    # Create detailed results table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS detailed_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            score FLOAT,
+            feedback TEXT,
+            evaluation_data TEXT,
+            FOREIGN KEY (exam_id) REFERENCES results (id)
+        )
+    """)
+    conn.commit()
     conn.close()
 
-    # Create exam_questions.db
+    # Create exam_questions.db with questions and user_answers tables
     conn = get_db_connection("exam_questions.db")
-    # First, drop existing tables if they exist
-    conn.execute("DROP TABLE IF EXISTS user_answers")
-    conn.execute("DROP TABLE IF EXISTS questions")
     
     # Create questions table
     conn.execute("""
@@ -86,7 +98,7 @@ def init_databases():
         )
     """)
     
-    # Create user_answers table with nullable is_correct
+    # Create user_answers table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_answers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,14 +106,36 @@ def init_databases():
             user_id TEXT NOT NULL,
             question_id INTEGER NOT NULL,
             answer TEXT,
-            is_correct INTEGER,  -- Changed to allow NULL
+            is_correct INTEGER,  -- Using INTEGER to allow NULL
             time_taken INTEGER,
             FOREIGN KEY (question_id) REFERENCES questions (id)
         )
     """)
+    conn.commit()
     conn.close()
 
-def save_exam_result(user_id: str, questions: list, answers: dict, score: float, subject: str) -> int:
+def verify_db_structure():
+    """Verify database structure and print current state"""
+    try:
+        # Check exam_questions.db structure
+        conn = get_db_connection("exam_questions.db")
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        print("\nTables in exam_questions.db:", [t[0] for t in tables])
+        
+        # Print schema for each table
+        for table in tables:
+            schema = conn.execute(f"PRAGMA table_info({table[0]})").fetchall()
+            print(f"\nSchema for {table[0]}:")
+            for col in schema:
+                print(f"  {col[1]} ({col[2]})")
+        conn.close()
+        
+        return True
+    except Exception as e:
+        print(f"Error verifying database structure: {str(e)}")
+        return False
+
+def save_exam_result(user_id: str, questions: list, answers: dict, score: float, subject: str, detailed_results: list = None) -> int:
     """Save exam result and all related data"""
     # Calculate grade based on score
     grade = calculate_grade(score)
@@ -123,35 +157,44 @@ def save_exam_result(user_id: str, questions: list, answers: dict, score: float,
         ))
         exam_id = cursor.lastrowid
         conn.commit()
-    finally:
-        conn.close()
 
-    # Save questions and answers
-    conn = get_db_connection("exam_questions.db")
-    try:
-        cursor = conn.cursor()
-        for q in questions:
-            q_type = q.get('type', '').lower()
-            correct_answer = q.get('correct_answer', '')
+        # Save detailed results if provided
+        if detailed_results:
+            for result in detailed_results:
+                cursor.execute("""
+                    INSERT INTO detailed_results (
+                        exam_id, question_id, score, feedback,
+                        evaluation_data
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    exam_id,
+                    result["question_id"],
+                    result["score"],
+                    result.get("feedback"),
+                    json.dumps(result.get("evaluation"))
+                ))
+            conn.commit()
+
+        # Save individual questions and answers
+        for question in questions:
+            q_id = str(question["id"])
+            q_type = question.get("type", "").lower()
+            correct_answer = question.get("correct_answer", "")
             
-            # Save question with subject
+            # Save question
             cursor.execute("""
                 INSERT INTO questions (
-                    exam_id, question_text, question_type,
-                    options, correct_answer, subject
+                    id, exam_id, question_text, question_type,
+                    correct_answer, subject
                 ) VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                exam_id,
-                q['question'],
-                q_type,
-                json.dumps(q.get('options', [])),
-                correct_answer if q_type not in ['essay', 'coding'] else None,
-                q.get('subject', subject)  # Use question-specific subject or exam subject
+                q_id, exam_id, question["question"], q_type,
+                correct_answer, question.get("subject", subject)
             ))
             question_id = cursor.lastrowid
             
             # Save user's answer
-            user_answer = answers.get(str(q['id']), '')
+            user_answer = answers.get(str(q_id), '')
             is_correct = None
             if q_type not in ['essay', 'coding']:
                 is_correct = 1 if str(user_answer).strip().lower() == str(correct_answer).strip().lower() else 0
@@ -167,14 +210,14 @@ def save_exam_result(user_id: str, questions: list, answers: dict, score: float,
             ))
         
         conn.commit()
+        return exam_id
+
     except Exception as e:
-        print(f"Error saving questions and answers: {str(e)}")
+        print(f"Error saving exam result: {str(e)}")
         conn.rollback()
         raise
     finally:
-        conn.close()
-    
-    return exam_id
+        conn.close()  # Close the main connection
 
 def calculate_grade(score: float) -> str:
     """Calculate letter grade based on score"""
@@ -481,6 +524,101 @@ def generate_questions():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def evaluate_essay(question: str, correct_answer: str, user_answer: str) -> dict:
+    """Evaluate essay answers using OpenAI"""
+    prompt = f"""
+    Evaluate this essay response based on the following criteria:
+    Question: {question}
+    Model Answer: {correct_answer}
+    Student's Answer: {user_answer}
+
+    Please analyze:
+    1. Content relevance (0-100)
+    2. Accuracy of information (0-100)
+    3. Clarity and organization (0-100)
+    4. Grammar and language (0-100)
+
+    Return a JSON with:
+    - Individual scores for each criterion
+    - Overall score (weighted average)
+    - Feedback comments
+    - Suggested improvements
+    """
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=os.getenv("DEPLOYMENT_NAME"),
+            messages=[
+                {"role": "system", "content": "You are an expert essay evaluator."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
+
+        evaluation = json.loads(response.choices[0].message.content)
+        return evaluation
+
+    except Exception as e:
+        print(f"Error evaluating essay: {str(e)}")
+        return {
+            "content_score": 0,
+            "accuracy_score": 0,
+            "clarity_score": 0,
+            "grammar_score": 0,
+            "overall_score": 0,
+            "feedback": "Error evaluating essay",
+            "improvements": []
+        }
+
+def evaluate_code(question: str, correct_answer: str, user_answer: str) -> dict:
+    """Evaluate coding answers using OpenAI"""
+    prompt = f"""
+    Evaluate this code solution based on the following criteria:
+    Problem: {question}
+    Model Solution: {correct_answer}
+    Student's Solution: {user_answer}
+
+    Please analyze:
+    1. Correctness (0-100)
+    2. Code efficiency (0-100)
+    3. Code style and readability (0-100)
+    4. Best practices (0-100)
+
+    Return a JSON with:
+    - Individual scores for each criterion
+    - Overall score (weighted average)
+    - Feedback comments
+    - Code improvements
+    - Any potential bugs or issues
+    """
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=os.getenv("DEPLOYMENT_NAME"),
+            messages=[
+                {"role": "system", "content": "You are an expert code evaluator."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
+
+        evaluation = json.loads(response.choices[0].message.content)
+        return evaluation
+
+    except Exception as e:
+        print(f"Error evaluating code: {str(e)}")
+        return {
+            "correctness_score": 0,
+            "efficiency_score": 0,
+            "style_score": 0,
+            "practices_score": 0,
+            "overall_score": 0,
+            "feedback": "Error evaluating code",
+            "improvements": []
+        }
+
 @app.route("/validate_answers", methods=["POST"])
 @jwt_required()
 def validate_answers():
@@ -494,60 +632,135 @@ def validate_answers():
 
         answers = data["answers"]
         questions = data["questions"]
-        subject = data.get("subject", "General")  # Get subject from request
+        subject = data.get("subject", "General")
 
-        # Initialize counter for correct answers
         correct_count = 0
         total_gradeable_questions = 0
+        detailed_results = []
 
-        # Validate answers and calculate score for questions that can be automatically graded
-        for question in questions:
-            q_id = str(question["id"])
-            q_type = question.get("type", "").lower()
-            user_answer = answers.get(q_id, "")
+        # Create a new exam result first to get the exam_id
+        conn = get_db_connection("exam_results.db")
+        cursor = conn.cursor()
+        
+        # Insert initial result to get exam_id
+        cursor.execute("""
+            INSERT INTO results (
+                user_id, score, grade, status, subject,
+                total_questions, correct_answers, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (user_id, 0, 'P', 'In Progress', subject, len(questions), 0))
+        exam_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
 
-            # Skip scoring for essay and coding questions
-            if q_type in ["essay", "coding"]:
-                continue
-
-            total_gradeable_questions += 1
-            
-            # Get correct answer safely
-            correct_answer = question.get("correct_answer", "")
-            if correct_answer and str(user_answer).strip().lower() == str(correct_answer).strip().lower():
-                correct_count += 1
-
-        # Calculate score percentage based only on gradeable questions
-        if total_gradeable_questions > 0:
-            score_percentage = round((correct_count / total_gradeable_questions) * 100, 2)
-        else:
-            score_percentage = 0
+        # Now use exam_questions.db for storing questions and answers
+        questions_conn = get_db_connection("exam_questions.db")
+        questions_cursor = questions_conn.cursor()
 
         try:
-            # Save all exam data using save_exam_result with subject
-            exam_id = save_exam_result(
-                user_id=user_id,
-                questions=questions,
-                answers=answers,
-                score=score_percentage,
-                subject=subject
-            )
+            for question in questions:
+                q_id = str(question["id"])
+                
+                # Insert the question first
+                questions_cursor.execute("""
+                    INSERT INTO questions (
+                        exam_id, question_text, question_type,
+                        options, correct_answer, subject
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    exam_id,
+                    question["question"],
+                    question.get("type", ""),
+                    json.dumps(question.get("options", [])),
+                    question.get("correct_answer", ""),
+                    question.get("subject", subject)
+                ))
+                question_id = questions_cursor.lastrowid
 
-            # Return the results
+                # Get user's answer
+                user_answer = answers.get(str(q_id), "")
+                
+                # Calculate score based on question type
+                question_type = question.get("type", "").lower()
+                question_score = 0
+                feedback = None
+                evaluation_data = None
+
+                if question_type in ["mcq", "true_false"]:
+                    is_correct = str(user_answer).strip().lower() == str(question.get("correct_answer", "")).strip().lower()
+                    question_score = 100 if is_correct else 0
+                    total_gradeable_questions += 1
+                    if is_correct:
+                        correct_count += 1
+                elif question_type == "essay":
+                    evaluation = evaluate_essay(
+                        question["question"],
+                        question.get("correct_answer", ""),
+                        user_answer
+                    )
+                    question_score = evaluation.get("overall_score", 0)
+                    feedback = evaluation.get("feedback")
+                    evaluation_data = json.dumps(evaluation)
+                    total_gradeable_questions += 1
+                elif question_type == "coding":
+                    evaluation = evaluate_code(
+                        question["question"],
+                        question.get("correct_answer", ""),
+                        user_answer
+                    )
+                    question_score = evaluation.get("overall_score", 0)
+                    feedback = evaluation.get("feedback")
+                    evaluation_data = json.dumps(evaluation)
+                    total_gradeable_questions += 1
+
+                # Insert user's answer
+                questions_cursor.execute("""
+                    INSERT INTO user_answers (
+                        exam_id, user_id, question_id,
+                        answer, is_correct, time_taken
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    exam_id,
+                    user_id,
+                    question_id,
+                    user_answer,
+                    1 if question_score == 100 else 0,
+                    None
+                ))
+
+                detailed_results.append({
+                    "question_id": question_id,
+                    "score": question_score,
+                    "feedback": feedback,
+                    "evaluation": json.loads(evaluation_data) if evaluation_data else None
+                })
+
+            questions_conn.commit()
+
+            # Calculate final score
+            final_score = (correct_count / total_gradeable_questions * 100) if total_gradeable_questions > 0 else 0
+            
+            # Update the final result
+            conn = get_db_connection("exam_results.db")
+            conn.execute("""
+                UPDATE results 
+                SET score = ?, grade = ?, status = ?, correct_answers = ?
+                WHERE id = ?
+            """, (final_score, calculate_grade(final_score), "Completed", correct_count, exam_id))
+            conn.commit()
+            conn.close()
+
             return jsonify({
                 "exam_id": exam_id,
-                "score": score_percentage,
-                "grade": calculate_grade(score_percentage),
-                "total_questions": len(questions),
-                "gradeable_questions": total_gradeable_questions,
+                "score": final_score,
+                "grade": calculate_grade(final_score),
                 "correct_answers": correct_count,
-                "status": "Passed" if score_percentage >= 60 else "Failed",
-                "subject": subject
+                "total_questions": total_gradeable_questions,
+                "detailed_results": detailed_results
             })
 
-        except Exception as e:
-            print(f"Error saving exam results: {str(e)}")
-            return jsonify({"error": "Failed to save exam results"}), 500
+        finally:
+            questions_conn.close()
 
     except Exception as e:
         print(f"Error in validate_answers: {str(e)}")
@@ -754,4 +967,6 @@ def health_check():
     return jsonify({"status": "healthy"}), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    init_databases()
+    verify_db_structure()
+    app.run(debug=True, port=5000)
