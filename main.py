@@ -341,18 +341,17 @@ def login():
             ).fetchone()
 
             if user and bcrypt.check_password_hash(user["password"], password):
-                token = create_access_token(identity=user["id"])
+                access_token = create_access_token(identity=email)
                 return jsonify({
-                    "token": token,
+                    "token": access_token,
                     "user": {
-                        "id": user["id"],
                         "email": user["email"],
                         "first_name": user["first_name"],
                         "last_name": user["last_name"]
                     }
                 })
-            
-            return jsonify({"error": "Invalid credentials"}), 401
+            else:
+                return jsonify({"error": "Invalid email or password"}), 401
         finally:
             conn.close()
     except Exception as e:
@@ -597,6 +596,57 @@ def submit_exam():
     except Exception as e:
         print(f"Error in submit_exam: {str(e)}")
         return jsonify({"error": "Failed to submit exam"}), 500
+
+@app.route("/update_profile", methods=["PUT"])
+@jwt_required()
+def update_profile():
+    try:
+        current_user_email = get_jwt_identity()  # This gets the email from the token
+        data = request.get_json()
+        
+        first_name = data.get("first_name")
+        last_name = data.get("last_name")
+        
+        if not all([first_name, last_name]):
+            return jsonify({"error": "First name and last name are required"}), 400
+
+        conn = get_db_connection("users.db")
+        try:
+            # Update using email instead of user_id
+            conn.execute(
+                """
+                UPDATE users 
+                SET first_name = ?, last_name = ?
+                WHERE email = ?
+                """,
+                (first_name, last_name, current_user_email)
+            )
+            conn.commit()
+            
+            # Fetch updated user data
+            user = conn.execute(
+                "SELECT email, first_name, last_name FROM users WHERE email = ?",
+                (current_user_email,)
+            ).fetchone()
+            
+            if user:
+                updated_user = {
+                    "email": user["email"],
+                    "first_name": user["first_name"],
+                    "last_name": user["last_name"]
+                }
+                return jsonify({
+                    "message": "Profile updated successfully",
+                    "user": updated_user
+                })
+            else:
+                return jsonify({"error": "User not found"}), 404
+                
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Error updating profile: {str(e)}")  # Add logging
+        return jsonify({"error": "Failed to update profile"}), 500
 
 # Add this route to test if the API is accessible
 @app.route("/health", methods=["GET"])
