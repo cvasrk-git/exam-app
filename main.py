@@ -108,36 +108,84 @@ def init_databases():
     conn.commit()
     conn.close()
 
-def save_exam_result(
-    user_id: int,
-    exam_id: int,
-    score: float,
-    grade: str,
-    status: str,
-    total_questions: int,
-    correct_answers: int,
-    completion_time: Optional[int] = None
-) -> int:
-    """Save exam result and return the result ID"""
-    conn = get_db_connection("exams.db")
-    cursor = conn.cursor()
+def save_exam_result(user_id: int, questions: list, answers: dict, score: float) -> int:
+    """Save exam result and all related data"""
+    # Calculate grade based on score
+    grade = calculate_grade(score)  # You'll need to implement this function
+    status = "Passed" if score >= 60 else "Failed"
+    total_questions = len(questions)
+    correct_answers = int((score / 100) * total_questions)
     
+    # Save main result
+    conn = get_db_connection("exam_results.db")
     try:
+        cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO exam_results (
-                user_id, exam_id, score, grade, status,
-                total_questions, correct_answers, completion_time,
-                completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO results (
+                user_id, score, grade, status, subject,
+                total_questions, correct_answers, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
-            user_id, exam_id, score, grade, status,
-            total_questions, correct_answers, completion_time
+            user_id, score, grade, status, "General",
+            total_questions, correct_answers
         ))
+        exam_id = cursor.lastrowid
         conn.commit()
-        result_id = cursor.lastrowid
-        return result_id
     finally:
         conn.close()
+
+    # Save questions and answers
+    questions_conn = get_db_connection("exam_questions.db")
+    try:
+        for q in questions:
+            # Save question
+            cursor = questions_conn.cursor()
+            cursor.execute("""
+                INSERT INTO questions (
+                    exam_id, question_text, question_type,
+                    options, correct_answer
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (
+                exam_id,
+                q['question'],
+                q.get('type', 'multiple_choice'),
+                json.dumps(q.get('options', [])),
+                q['correct_answer']
+            ))
+            question_id = cursor.lastrowid
+            
+            # Save user's answer
+            user_answer = answers.get(str(q['id']), '')
+            is_correct = user_answer == q['correct_answer']
+            
+            cursor.execute("""
+                INSERT INTO user_answers (
+                    exam_id, user_id, question_id,
+                    answer, is_correct
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (
+                exam_id, user_id, question_id,
+                user_answer, is_correct
+            ))
+        
+        questions_conn.commit()
+    finally:
+        questions_conn.close()
+    
+    return exam_id
+
+def calculate_grade(score: float) -> str:
+    """Calculate letter grade based on score"""
+    if score >= 90:
+        return "A"
+    elif score >= 80:
+        return "B"
+    elif score >= 70:
+        return "C"
+    elif score >= 60:
+        return "D"
+    else:
+        return "F"
 
 def save_user_answer(
     user_id: int,
@@ -486,6 +534,42 @@ def get_exam_detail(exam_id):
     except Exception as e:
         print(f"Error in get_exam_detail endpoint: {str(e)}")
         return jsonify({"error": "Failed to get exam detail", "details": str(e)}), 500
+
+@app.route("/submit_exam", methods=["POST"])
+@jwt_required()
+def submit_exam():
+    """Handle exam submission"""
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json()
+        
+        if not data or 'questions' not in data or 'answers' not in data:
+            return jsonify({"error": "Invalid submission data"}), 400
+        
+        questions = data['questions']
+        answers = data['answers']
+        
+        # Calculate score
+        total_questions = len(questions)
+        correct_answers = sum(
+            1 for q in questions
+            if answers.get(str(q['id'])) == q['correct_answer']
+        )
+        score = (correct_answers / total_questions) * 100 if total_questions > 0 else 0
+        
+        # Save all exam data
+        exam_id = save_exam_result(user_id, questions, answers, score)
+        
+        return jsonify({
+            "message": "Exam submitted successfully",
+            "exam_id": exam_id,
+            "score": score,
+            "grade": calculate_grade(score)
+        })
+        
+    except Exception as e:
+        print(f"Error in submit_exam: {str(e)}")
+        return jsonify({"error": "Failed to submit exam"}), 500
 
 # Add this route to test if the API is accessible
 @app.route("/health", methods=["GET"])
