@@ -101,7 +101,7 @@ def init_databases():
     """)
     conn.close()
 
-def save_exam_result(user_id: str, questions: list, answers: dict, score: float) -> int:
+def save_exam_result(user_id: str, questions: list, answers: dict, score: float, subject: str) -> int:
     """Save exam result and all related data"""
     # Calculate grade based on score
     grade = calculate_grade(score)
@@ -118,7 +118,7 @@ def save_exam_result(user_id: str, questions: list, answers: dict, score: float)
                 total_questions, correct_answers, timestamp
             ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
-            user_id, score, grade, status, "General",
+            user_id, score, grade, status, subject,
             total_questions, int((score / 100) * total_questions)
         ))
         exam_id = cursor.lastrowid
@@ -134,7 +134,7 @@ def save_exam_result(user_id: str, questions: list, answers: dict, score: float)
             q_type = q.get('type', '').lower()
             correct_answer = q.get('correct_answer', '')
             
-            # Save question
+            # Save question with subject
             cursor.execute("""
                 INSERT INTO questions (
                     exam_id, question_text, question_type,
@@ -146,7 +146,7 @@ def save_exam_result(user_id: str, questions: list, answers: dict, score: float)
                 q_type,
                 json.dumps(q.get('options', [])),
                 correct_answer if q_type not in ['essay', 'coding'] else None,
-                q.get('subject', 'General')
+                q.get('subject', subject)  # Use question-specific subject or exam subject
             ))
             question_id = cursor.lastrowid
             
@@ -230,14 +230,14 @@ def get_exam_details(exam_result_id: int, user_id: int) -> dict:
         # Convert row to dictionary
         exam_detail = {
             "id": str(result["id"]),
-            "subject": result["subject"],
             "score": result["score"],
             "grade": result["grade"],
             "status": result["status"],
             "timestamp": result["timestamp"],
             "total_questions": result["total_questions"],
             "correct_answers": result["correct_answers"],
-            "questions": []  # Initialize with empty list
+            "questions": [],  # Initialize with empty list
+            "subject": result["subject"] if result["subject"] != "General" else None  # Get subject from result
         }
         
         try:
@@ -245,7 +245,8 @@ def get_exam_details(exam_result_id: int, user_id: int) -> dict:
             questions_conn = get_db_connection("exam_questions.db")
             questions = questions_conn.execute("""
                 SELECT q.id, q.question_text as question, q.correct_answer, 
-                       ua.answer as user_answer, q.options, q.question_type as type
+                       ua.answer as user_answer, q.options, q.question_type as type,
+                       q.subject
                 FROM questions q
                 JOIN user_answers ua ON q.id = ua.question_id
                 WHERE ua.exam_id = ? AND ua.user_id = ?
@@ -253,19 +254,28 @@ def get_exam_details(exam_result_id: int, user_id: int) -> dict:
             """, (exam_result_id, user_id)).fetchall()
             
             if questions:
+                # If subject not found in results, use most common subject from questions
+                if not exam_detail["subject"]:
+                    subjects = [q["subject"] for q in questions if q["subject"] != "General"]
+                    if subjects:
+                        from collections import Counter
+                        exam_detail["subject"] = Counter(subjects).most_common(1)[0][0]
+                    else:
+                        exam_detail["subject"] = "General"
+                
                 exam_detail["questions"] = [{
                     "id": q["id"],
                     "question": q["question"],
                     "correct_answer": q["correct_answer"],
                     "user_answer": q["user_answer"],
                     "options": json.loads(q["options"]) if q["options"] else None,
-                    "type": q["type"]
+                    "type": q["type"],
+                    "subject": q["subject"]
                 } for q in questions]
             
             questions_conn.close()
         except Exception as e:
             print(f"Warning: Could not fetch questions data: {str(e)}")
-            # Continue without questions data
             
         return exam_detail
         
@@ -365,6 +375,29 @@ def protected():
     return jsonify({"message": f"Welcome {current_user}!"})
 
 # Exam routes
+def extract_subject(text: str) -> str:
+    """Extract subject from text based on common subjects"""
+    subjects = [
+        # Academic subjects
+        "Mathematics", "Physics", "Chemistry", "Biology",
+        "History", "Geography", "Literature", "English",
+        # Technology subjects
+        "Python", "Java", "JavaScript", "TypeScript",
+        "React", "Angular", "Vue", "NodeJS",
+        "Database", "SQL", "MongoDB", "AWS",
+        "Docker", "Kubernetes", "DevOps", "Machine Learning",
+        "Artificial Intelligence", "Web Development",
+        "Mobile Development", "Cloud Computing",
+        "Cybersecurity", "Networking", "Data Structures",
+        "Algorithms", "Software Engineering"
+    ]
+    
+    text_lower = text.lower()
+    for subject in subjects:
+        if subject.lower() in text_lower:
+            return subject
+    return "General"
+
 @app.route("/generate_questions", methods=["POST"])
 @jwt_required()
 def generate_questions():
@@ -377,8 +410,11 @@ def generate_questions():
         if not prompt:
             return jsonify({"error": "Prompt is required"}), 400
 
+        # Extract subject from prompt
+        subject = extract_subject(prompt)
+
         formatted_prompt = f"""
-        Generate a set of exam questions based on the prompt:
+        Generate a set of exam questions for the subject '{subject}' based on the prompt:
         '{prompt}'
 
         Each question must be a dictionary with:
@@ -389,13 +425,17 @@ def generate_questions():
         - 'correct_answer': correct answer text (except for 'coding' and 'essay')
         - 'hint': a short hint for the question
         - 'time_limit': time in seconds (default {DEFAULT_TIME_LIMIT})
+        - 'subject': the specific subject or topic of this question
 
         Format the response as a JSON array of question objects without Markdown formatting.
         """
-
+        print("Formatted Prompt:"+formatted_prompt)
         response = openai_client.chat.completions.create(
             model=os.getenv("DEPLOYMENT_NAME"),
-            messages=[{"role": "system", "content": formatted_prompt}],
+            messages=[
+                {"role": "system", "content": "You are an expert exam question generator."},
+                {"role": "user", "content": formatted_prompt}
+            ],
             temperature=0.7,
             max_tokens=800,
         )
@@ -407,18 +447,34 @@ def generate_questions():
         if not isinstance(questions_json, list):
             raise ValueError("Invalid JSON response from OpenAI.")
 
-        # Initialize question timing
+        # Initialize question timing and ensure required fields
         question_start_times[user_id] = {
             str(q.get("id", "")): time.time() 
             for q in questions_json
         }
 
-        # Ensure required fields
+        # Verify subject from generated questions
+        questions_text = " ".join([
+            q.get("question", "") + " " + 
+            q.get("correct_answer", "") + " " + 
+            " ".join(q.get("options", []))
+            for q in questions_json
+        ])
+        verified_subject = extract_subject(questions_text)
+        
+        # Use the more specific subject between prompt and questions
+        final_subject = verified_subject if verified_subject != "General" else subject
+
+        # Add subject to each question
         for question in questions_json:
             question.setdefault("hint", "No hint available")
             question.setdefault("time_limit", DEFAULT_TIME_LIMIT)
+            question["subject"] = final_subject
 
-        return jsonify({"questions": questions_json})
+        return jsonify({
+            "questions": questions_json,
+            "subject": final_subject
+        })
 
     except json.JSONDecodeError:
         return jsonify({"error": "Invalid JSON format received from OpenAI"}), 500
@@ -438,7 +494,7 @@ def validate_answers():
 
         answers = data["answers"]
         questions = data["questions"]
-        subject = data.get("subject", "General")
+        subject = data.get("subject", "General")  # Get subject from request
 
         # Initialize counter for correct answers
         correct_count = 0
@@ -465,15 +521,16 @@ def validate_answers():
         if total_gradeable_questions > 0:
             score_percentage = round((correct_count / total_gradeable_questions) * 100, 2)
         else:
-            score_percentage = 0  # Or handle this case as needed
+            score_percentage = 0
 
         try:
-            # Save all exam data using save_exam_result
+            # Save all exam data using save_exam_result with subject
             exam_id = save_exam_result(
                 user_id=user_id,
                 questions=questions,
                 answers=answers,
-                score=score_percentage
+                score=score_percentage,
+                subject=subject
             )
 
             # Return the results
@@ -484,7 +541,8 @@ def validate_answers():
                 "total_questions": len(questions),
                 "gradeable_questions": total_gradeable_questions,
                 "correct_answers": correct_count,
-                "status": "Passed" if score_percentage >= 60 else "Failed"
+                "status": "Passed" if score_percentage >= 60 else "Failed",
+                "subject": subject
             })
 
         except Exception as e:
@@ -501,50 +559,87 @@ def get_results():
     """Retrieve exam results for the current user"""
     try:
         user_id = get_jwt_identity()
-        conn = get_db_connection("exam_results.db")
         
-        results = conn.execute("""
-            SELECT *
-            FROM results 
+        # First get results from results table
+        results_conn = get_db_connection("exam_results.db")
+        results = results_conn.execute("""
+            SELECT * FROM results 
             WHERE user_id = ? 
             ORDER BY timestamp DESC
         """, (user_id,)).fetchall()
-        
-        conn.close()
+        results_conn.close()
 
         if not results:
             return jsonify({"message": "No results found"}), 404
 
-        results_list = [{
-            "id": row["id"],
-            "user_id": row["user_id"],
-            "score": row["score"],
-            "grade": row["grade"],
-            "status": row["status"],
-            "timestamp": row["timestamp"],
-            "subject": row["subject"],
-            "total_questions": row["total_questions"],
-            "correct_answers": row["correct_answers"]
-        } for row in results]
+        # Get subjects from questions table for each exam
+        questions_conn = get_db_connection("exam_questions.db")
+        results_list = []
+        
+        for row in results:
+            # Convert sqlite3.Row to dict
+            result_dict = dict(row)
+            
+            # Get the most common subject for this exam
+            subjects = questions_conn.execute("""
+                SELECT subject, COUNT(*) as count 
+                FROM questions 
+                WHERE exam_id = ? 
+                GROUP BY subject 
+                ORDER BY count DESC 
+                LIMIT 1
+            """, (result_dict["id"],)).fetchone()
 
-        # Calculate statistics
-        total_exams = len(results_list)
-        average_score = round(
-            sum(r["score"] for r in results_list) / total_exams 
-            if total_exams > 0 else 0, 
-            2
-        )
+            # Convert subjects Row to dict if it exists
+            subject = dict(subjects)["subject"] if subjects else result_dict["subject"] if "subject" in result_dict else "General"
+            
+            results_list.append({
+                "id": result_dict["id"],
+                "user_id": result_dict["user_id"],
+                "score": result_dict["score"],
+                "grade": result_dict["grade"],
+                "status": result_dict["status"],
+                "timestamp": result_dict["timestamp"],
+                "subject": subject,
+                "total_questions": result_dict["total_questions"],
+                "correct_answers": result_dict["correct_answers"]
+            })
+        
+        questions_conn.close()
+
+        # Calculate statistics by subject
+        subjects = {}
+        for r in results_list:
+            subj = r["subject"]
+            if subj not in subjects:
+                subjects[subj] = {"count": 0, "total_score": 0}
+            subjects[subj]["count"] += 1
+            subjects[subj]["total_score"] += r["score"]
+
+        subject_stats = {
+            subj: {
+                "average_score": round(data["total_score"] / data["count"], 2),
+                "exam_count": data["count"]
+            }
+            for subj, data in subjects.items()
+        }
 
         return jsonify({
             "results": results_list,
             "statistics": {
-                "total_exams": total_exams,
-                "average_score": average_score,
-                "last_exam_score": results_list[0]["score"] if results_list else 0
+                "total_exams": len(results_list),
+                "average_score": round(
+                    sum(r["score"] for r in results_list) / len(results_list)
+                    if results_list else 0, 
+                    2
+                ),
+                "last_exam_score": results_list[0]["score"] if results_list else 0,
+                "by_subject": subject_stats
             }
         })
 
     except Exception as e:
+        print(f"Error in get_results: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/exam_detail/<int:exam_id>", methods=["GET"])
