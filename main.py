@@ -56,7 +56,9 @@ def init_databases():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL
+            password TEXT NOT NULL,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -284,20 +286,35 @@ def register():
         data = request.get_json()
         email = data.get("email")
         password = data.get("password")
+        first_name = data.get("first_name")
+        last_name = data.get("last_name")
 
-        if not email or not password:
-            return jsonify({"error": "Email and password are required"}), 400
+        # Validate required fields
+        if not all([email, password, first_name, last_name]):
+            return jsonify({
+                "error": "Email, password, first name, and last name are required"
+            }), 400
 
         hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
 
-        conn = get_db_connection()
+        conn = get_db_connection("users.db")
         try:
             conn.execute(
-                "INSERT INTO users (email, password) VALUES (?, ?)", 
-                (email, hashed_password)
+                """
+                INSERT INTO users (email, password, first_name, last_name)
+                VALUES (?, ?, ?, ?)
+                """, 
+                (email, hashed_password, first_name, last_name)
             )
             conn.commit()
-            return jsonify({"message": "User registered successfully!"})
+            return jsonify({
+                "message": "User registered successfully!",
+                "user": {
+                    "email": email,
+                    "first_name": first_name,
+                    "last_name": last_name
+                }
+            })
         except sqlite3.IntegrityError:
             return jsonify({"error": "Email already exists"}), 400
         finally:
@@ -316,18 +333,28 @@ def login():
         if not email or not password:
             return jsonify({"error": "Email and password are required"}), 400
 
-        conn = get_db_connection()
-        user = conn.execute(
-            "SELECT * FROM users WHERE email = ?", 
-            (email,)
-        ).fetchone()
-        conn.close()
+        conn = get_db_connection("users.db")
+        try:
+            user = conn.execute(
+                "SELECT * FROM users WHERE email = ?", 
+                (email,)
+            ).fetchone()
 
-        if user and bcrypt.check_password_hash(user["password"], password):
-            token = create_access_token(identity=email)
-            return jsonify({"token": token})
-        
-        return jsonify({"error": "Invalid credentials"}), 401
+            if user and bcrypt.check_password_hash(user["password"], password):
+                token = create_access_token(identity=user["id"])
+                return jsonify({
+                    "token": token,
+                    "user": {
+                        "id": user["id"],
+                        "email": user["email"],
+                        "first_name": user["first_name"],
+                        "last_name": user["last_name"]
+                    }
+                })
+            
+            return jsonify({"error": "Invalid credentials"}), 401
+        finally:
+            conn.close()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
