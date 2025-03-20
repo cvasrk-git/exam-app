@@ -14,7 +14,7 @@ from flask_jwt_extended import (
     get_jwt_identity
 )
 import sqlite3
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -67,7 +67,7 @@ def init_databases():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
             score REAL NOT NULL,
             grade TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -79,6 +79,151 @@ def init_databases():
     """)
     conn.commit()
     conn.close()
+
+    # Questions and answers tables
+    conn = get_db_connection("exam_questions.db")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id INTEGER NOT NULL,
+            question_text TEXT NOT NULL,
+            question_type TEXT NOT NULL,
+            options TEXT,
+            correct_answer TEXT NOT NULL
+        )
+    """)
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            answer TEXT NOT NULL,
+            is_correct BOOLEAN NOT NULL,
+            time_taken INTEGER,
+            FOREIGN KEY (question_id) REFERENCES questions (id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_exam_result(
+    user_id: int,
+    exam_id: int,
+    score: float,
+    grade: str,
+    status: str,
+    total_questions: int,
+    correct_answers: int,
+    completion_time: Optional[int] = None
+) -> int:
+    """Save exam result and return the result ID"""
+    conn = get_db_connection("exams.db")
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO exam_results (
+                user_id, exam_id, score, grade, status,
+                total_questions, correct_answers, completion_time,
+                completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            user_id, exam_id, score, grade, status,
+            total_questions, correct_answers, completion_time
+        ))
+        conn.commit()
+        result_id = cursor.lastrowid
+        return result_id
+    finally:
+        conn.close()
+
+def save_user_answer(
+    user_id: int,
+    exam_id: int,
+    question_id: int,
+    answer: str,
+    is_correct: bool,
+    time_taken: Optional[int] = None
+) -> None:
+    """Save user's answer for a question"""
+    conn = get_db_connection("exams.db")
+    try:
+        conn.execute("""
+            INSERT INTO user_answers (
+                user_id, exam_id, question_id, answer,
+                is_correct, time_taken
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user_id, exam_id, question_id, answer,
+            is_correct, time_taken
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_exam_details(exam_result_id: int, user_id: int) -> dict:
+    """Get detailed exam result including questions and answers"""
+    conn = get_db_connection("exam_results.db")
+    try:
+        # Get exam result
+        result = conn.execute("""
+            SELECT *
+            FROM results 
+            WHERE id = ? AND user_id = ?
+        """, (exam_result_id, user_id)).fetchone()
+        
+        if not result:
+            return None
+            
+        # Convert row to dictionary
+        exam_detail = {
+            "id": str(result["id"]),
+            "subject": result["subject"],
+            "score": result["score"],
+            "grade": result["grade"],
+            "status": result["status"],
+            "timestamp": result["timestamp"],
+            "total_questions": result["total_questions"],
+            "correct_answers": result["correct_answers"],
+            "questions": []  # Initialize with empty list
+        }
+        
+        try:
+            # Attempt to get questions data
+            questions_conn = get_db_connection("exam_questions.db")
+            questions = questions_conn.execute("""
+                SELECT q.id, q.question_text as question, q.correct_answer, 
+                       ua.answer as user_answer, q.options, q.question_type as type
+                FROM questions q
+                JOIN user_answers ua ON q.id = ua.question_id
+                WHERE ua.exam_id = ? AND ua.user_id = ?
+                ORDER BY q.id
+            """, (exam_result_id, user_id)).fetchall()
+            
+            if questions:
+                exam_detail["questions"] = [{
+                    "id": q["id"],
+                    "question": q["question"],
+                    "correct_answer": q["correct_answer"],
+                    "user_answer": q["user_answer"],
+                    "options": json.loads(q["options"]) if q["options"] else None,
+                    "type": q["type"]
+                } for q in questions]
+            
+            questions_conn.close()
+        except Exception as e:
+            print(f"Warning: Could not fetch questions data: {str(e)}")
+            # Continue without questions data
+            
+        return exam_detail
+        
+    except Exception as e:
+        print(f"Database error in get_exam_details: {str(e)}")
+        raise
+    finally:
+        conn.close()  # Close the main connection
 
 # Initialize databases on startup
 init_databases()
@@ -322,6 +467,30 @@ def get_results():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/exam_detail/<int:exam_id>", methods=["GET"])
+@jwt_required()
+def get_exam_detail(exam_id):
+    """Get detailed exam result"""
+    try:
+        user_id = get_jwt_identity()
+        
+        # Get exam details
+        exam_detail = get_exam_details(exam_id, user_id)
+        
+        if not exam_detail:
+            return jsonify({"error": "Exam not found"}), 404
+            
+        return jsonify(exam_detail)
+        
+    except Exception as e:
+        print(f"Error in get_exam_detail endpoint: {str(e)}")
+        return jsonify({"error": "Failed to get exam detail", "details": str(e)}), 500
+
+# Add this route to test if the API is accessible
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
