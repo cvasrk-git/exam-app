@@ -474,7 +474,7 @@ def extract_subject(text: str) -> str:
     return "General"
 
 def extract_question_type(text: str) -> str:
-    """Extract question type from prompt text"""
+    """Extract question type from prompt text, defaults to mcq if no match found"""
     # Define keywords for each question type
     type_keywords = {
         "mcq": ["mcq", "multiple choice", "multiple-choice"],
@@ -488,7 +488,7 @@ def extract_question_type(text: str) -> str:
     for q_type, keywords in type_keywords.items():
         if any(keyword in text_lower for keyword in keywords):
             return q_type
-    return None
+    return "mcq"  # Default to mcq instead of None
 
 @app.route("/generate_questions", methods=["POST"])
 @jwt_required()
@@ -507,12 +507,9 @@ def generate_questions():
         # Extract subject and question type
         subject = extract_subject(prompt)
         question_type = extract_question_type(prompt)
-
-        if not question_type:
-            return jsonify({
-                "error": "Question type not specified. Please include one of: multiple choice (MCQ), true/false, short answer, coding, or essay in your prompt."
-            }), 400
-
+        
+        # Remove the error check since question_type will always have a value now
+        
         formatted_prompt = f"""
         Generate {question_type.upper()} questions for the subject '{subject}' based on the prompt:
         '{prompt}'
