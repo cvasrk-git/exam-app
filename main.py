@@ -490,6 +490,20 @@ def extract_question_type(text: str) -> str:
             return q_type
     return "mcq"  # Default to mcq instead of None
 
+def extract_difficulty_level(text: str) -> str:
+    """Extract difficulty level from prompt text based on keywords"""
+    level_keywords = {
+        "basic": ["basic", "beginner", "elementary", "easy", "fundamental", "simple", "entry level", "entry-level"],
+        "intermediate": ["intermediate", "medium", "moderate", "middle", "regular"],
+        "advanced": ["advanced", "expert", "difficult", "hard", "complex", "challenging", "advanced level", "expert level"]
+    }
+    
+    text_lower = text.lower()
+    for level, keywords in level_keywords.items():
+        if any(keyword in text_lower for keyword in keywords):
+            return level
+    return "intermediate"  # Default to intermediate if no level is specified
+
 @app.route("/generate_questions", methods=["POST"])
 @jwt_required()
 def generate_questions():
@@ -501,27 +515,29 @@ def generate_questions():
 
         if not prompt:
             return jsonify({
-                "error": "Prompt is required. Please provide a detailed prompt including subject and question type."
+                "error": "Prompt is required. Please provide a detailed prompt including subject, question type, and difficulty level."
             }), 400
 
-        # Extract subject and question type
+        # Extract subject, question type, and difficulty level from prompt
         subject = extract_subject(prompt)
         question_type = extract_question_type(prompt)
-        
-        # Remove the error check since question_type will always have a value now
+        difficulty_level = extract_difficulty_level(prompt)
         
         formatted_prompt = f"""
-        Generate {question_type.upper()} questions for the subject '{subject}' based on the prompt:
+        Generate {difficulty_level.upper()} level {question_type.upper()} questions for the subject '{subject}' based on the prompt:
         '{prompt}'
 
-        Follow these strict rules for the {question_type} type:
+        Difficulty Level: {difficulty_level}
+        {get_level_specific_rules(difficulty_level)}
 
+        Follow these strict rules for the {question_type} type:
         {get_question_type_rules(question_type)}
 
         Each question must be a dictionary with:
         - 'id': unique question ID
         - 'question': clear, well-formed question text
         - 'type': "{question_type}"
+        - 'level': "{difficulty_level}"
         {get_type_specific_fields(question_type)}
         - 'hint': specific, helpful hint that guides without giving away the answer
         - 'time_limit': time in seconds (default {DEFAULT_TIME_LIMIT})
@@ -529,13 +545,14 @@ def generate_questions():
 
         Format the response as a JSON array of question objects without Markdown formatting.
         """
-        print("Formatted Prompt:"+formatted_prompt)
+        print(f"Generating questions with level: {difficulty_level}")
+        
         response = openai_client.chat.completions.create(
             model=os.getenv("DEPLOYMENT_NAME"),
             messages=[
                 {
                     "role": "system", 
-                    "content": f"You are an expert {question_type} question generator. Generate only {question_type} questions following the specified format."
+                    "content": f"You are an expert {question_type} question generator specializing in {difficulty_level} level questions. Generate only {difficulty_level} {question_type} questions following the specified format."
                 },
                 {"role": "user", "content": formatted_prompt}
             ],
@@ -548,12 +565,13 @@ def generate_questions():
         questions_json = json.loads(clean_json)
 
         # Validate questions
-        validate_questions(questions_json, question_type)
+        validate_questions(questions_json, question_type, difficulty_level)
 
         return jsonify({
             "questions": questions_json,
             "subject": subject,
-            "question_type": question_type
+            "question_type": question_type,
+            "level": difficulty_level
         })
 
     except json.JSONDecodeError:
@@ -636,12 +654,18 @@ def get_type_specific_fields(q_type: str) -> str:
     }
     return fields.get(q_type, "")
 
-def validate_questions(questions: list, expected_type: str) -> None:
-    """Validate questions match the expected type and format"""
+def validate_questions(questions: list, expected_type: str, expected_level: str) -> None:
+    """Validate questions match the expected type, format, and difficulty level"""
     for question in questions:
+        # Validate question type
         if question.get("type") != expected_type:
             raise ValueError(f"Question type mismatch. Expected {expected_type}, got {question.get('type')}")
         
+        # Validate difficulty level
+        if question.get("level") != expected_level:
+            question["level"] = expected_level
+        
+        # Validate type-specific requirements
         if expected_type == "mcq":
             if not question.get("options") or len(question["options"]) != 4:
                 raise ValueError("MCQ questions must have exactly 4 options")
@@ -1152,7 +1176,7 @@ def submit_exam():
             1 for q in questions
             if answers.get(str(q['id'])) == q['correct_answer']
         )
-        score = (correct_answers / total_questions) * 100 if total_questions > 0 else 0
+        score = round((correct_answers / total_questions) * 100, 2) if total_questions > 0 else 0
         
         # Save all exam data
         exam_id = save_exam_result(user_id, questions, answers, score)
@@ -1223,6 +1247,36 @@ def update_profile():
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy"}), 200
+
+def get_level_specific_rules(level: str) -> str:
+    """Get specific rules for each difficulty level"""
+    rules = {
+        "basic": """
+        - Questions should cover fundamental concepts
+        - Use simple, clear language
+        - Focus on direct recall and basic understanding
+        - Avoid complex terminology
+        - Include straightforward scenarios
+        """,
+        
+        "intermediate": """
+        - Questions should require deeper understanding
+        - Test application of concepts
+        - Can include some technical terminology
+        - May combine multiple basic concepts
+        - Include practical scenarios
+        """,
+        
+        "advanced": """
+        - Questions should test complex understanding
+        - Include advanced concepts and edge cases
+        - Use technical terminology appropriately
+        - Require analysis and problem-solving
+        - Can combine multiple concepts
+        - Include challenging scenarios
+        """
+    }
+    return rules.get(level, "Follow standard difficulty level guidelines.")
 
 if __name__ == "__main__":
     init_databases()
