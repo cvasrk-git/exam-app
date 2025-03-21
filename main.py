@@ -50,69 +50,88 @@ def get_db_connection(db_name: str = "users.db") -> sqlite3.Connection:
 
 def init_databases():
     """Initialize all required database tables"""
-    # Create exam_results.db
-    conn = get_db_connection("exam_results.db")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            score REAL NOT NULL,
-            grade TEXT NOT NULL,
-            status TEXT NOT NULL,
-            subject TEXT DEFAULT 'General',
-            total_questions INTEGER NOT NULL,
-            correct_answers INTEGER NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-
-    # Create detailed results table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS detailed_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            exam_id INTEGER NOT NULL,
-            question_id INTEGER NOT NULL,
-            score FLOAT,
-            feedback TEXT,
-            evaluation_data TEXT,
-            FOREIGN KEY (exam_id) REFERENCES results (id)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-    # Create exam_questions.db with questions and user_answers tables
-    conn = get_db_connection("exam_questions.db")
+    print("Starting database initialization...")
     
-    # Create questions table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            exam_id INTEGER NOT NULL,
-            question_text TEXT NOT NULL,
-            question_type TEXT NOT NULL,
-            options TEXT,
-            correct_answer TEXT,
-            subject TEXT DEFAULT 'General'
-        )
-    """)
-    
-    # Create user_answers table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_answers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            exam_id INTEGER NOT NULL,
-            user_id TEXT NOT NULL,
-            question_id INTEGER NOT NULL,
-            answer TEXT,
-            is_correct INTEGER,  -- Using INTEGER to allow NULL
-            time_taken INTEGER,
-            FOREIGN KEY (question_id) REFERENCES questions (id)
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        # Create exam_questions.db first
+        print("Creating exam_questions.db tables...")
+        conn = get_db_connection("exam_questions.db")
+        cursor = conn.cursor()
+        
+        # Create questions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exam_id INTEGER NOT NULL,
+                question_text TEXT NOT NULL,
+                question_type TEXT NOT NULL,
+                options TEXT,
+                correct_answer TEXT,
+                subject TEXT DEFAULT 'General'
+            )
+        """)
+        print("Created questions table")
+        
+        # Create user_answers table with accuracy_percentage column
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_answers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exam_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                question_id INTEGER NOT NULL,
+                answer TEXT,
+                is_correct INTEGER,
+                accuracy_percentage REAL DEFAULT 0,
+                time_taken INTEGER,
+                FOREIGN KEY (question_id) REFERENCES questions (id)
+            )
+        """)
+        print("Created user_answers table")
+        conn.commit()
+        conn.close()
+
+        # Create exam_results.db
+        print("Creating exam_results.db tables...")
+        conn = get_db_connection("exam_results.db")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                score REAL NOT NULL,
+                grade TEXT NOT NULL,
+                status TEXT NOT NULL,
+                subject TEXT DEFAULT 'General',
+                total_questions INTEGER NOT NULL,
+                correct_answers INTEGER NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+        # Create detailed results table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS detailed_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exam_id INTEGER NOT NULL,
+                question_id INTEGER NOT NULL,
+                score FLOAT,
+                feedback TEXT,
+                evaluation_data TEXT,
+                FOREIGN KEY (exam_id) REFERENCES results (id)
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print("Database initialization completed successfully")
+
+    except Exception as e:
+        print(f"Error during database initialization: {str(e)}")
+        raise
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
 
 def verify_db_structure():
     """Verify database structure and print current state"""
@@ -128,12 +147,16 @@ def verify_db_structure():
             print(f"\nSchema for {table[0]}:")
             for col in schema:
                 print(f"  {col[1]} ({col[2]})")
-        conn.close()
         
         return True
     except Exception as e:
         print(f"Error verifying database structure: {str(e)}")
         return False
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
 
 def save_exam_result(user_id: str, questions: list, answers: dict, score: float, subject: str, detailed_results: list = None) -> int:
     """Save exam result and all related data"""
@@ -279,17 +302,24 @@ def get_exam_details(exam_result_id: int, user_id: int) -> dict:
             "timestamp": result["timestamp"],
             "total_questions": result["total_questions"],
             "correct_answers": result["correct_answers"],
-            "questions": [],  # Initialize with empty list
-            "subject": result["subject"] if result["subject"] != "General" else None  # Get subject from result
+            "questions": [],
+            "subject": result["subject"] if result["subject"] != "General" else None
         }
         
         try:
-            # Attempt to get questions data
+            # Get questions data with accuracy percentage
             questions_conn = get_db_connection("exam_questions.db")
             questions = questions_conn.execute("""
-                SELECT q.id, q.question_text as question, q.correct_answer, 
-                       ua.answer as user_answer, q.options, q.question_type as type,
-                       q.subject
+                SELECT 
+                    q.id, 
+                    q.question_text as question, 
+                    q.correct_answer, 
+                    ua.answer as user_answer, 
+                    q.options, 
+                    q.question_type as type,
+                    q.subject,
+                    ua.accuracy_percentage,
+                    ua.is_correct
                 FROM questions q
                 JOIN user_answers ua ON q.id = ua.question_id
                 WHERE ua.exam_id = ? AND ua.user_id = ?
@@ -297,7 +327,6 @@ def get_exam_details(exam_result_id: int, user_id: int) -> dict:
             """, (exam_result_id, user_id)).fetchall()
             
             if questions:
-                # If subject not found in results, use most common subject from questions
                 if not exam_detail["subject"]:
                     subjects = [q["subject"] for q in questions if q["subject"] != "General"]
                     if subjects:
@@ -313,15 +342,18 @@ def get_exam_details(exam_result_id: int, user_id: int) -> dict:
                     "user_answer": q["user_answer"],
                     "options": json.loads(q["options"]) if q["options"] else None,
                     "type": q["type"],
-                    "subject": q["subject"]
+                    "subject": q["subject"],
+                    "accuracy_percentage": q["accuracy_percentage"],
+                    "is_correct": bool(q["is_correct"])
                 } for q in questions]
             
             questions_conn.close()
+            return exam_detail
+            
         except Exception as e:
             print(f"Warning: Could not fetch questions data: {str(e)}")
+            return exam_detail
             
-        return exam_detail
-        
     except Exception as e:
         print(f"Database error in get_exam_details: {str(e)}")
         raise
@@ -441,6 +473,23 @@ def extract_subject(text: str) -> str:
             return subject
     return "General"
 
+def extract_question_type(text: str) -> str:
+    """Extract question type from prompt text"""
+    # Define keywords for each question type
+    type_keywords = {
+        "mcq": ["mcq", "multiple choice", "multiple-choice"],
+        "true_false": ["true false", "true/false", "true-false", "t/f"],
+        "short_answer": ["short answer", "short-answer", "brief answer"],
+        "coding": ["coding", "code", "programming"],
+        "essay": ["essay", "long answer", "written response"]
+    }
+    
+    text_lower = text.lower()
+    for q_type, keywords in type_keywords.items():
+        if any(keyword in text_lower for keyword in keywords):
+            return q_type
+    return None
+
 @app.route("/generate_questions", methods=["POST"])
 @jwt_required()
 def generate_questions():
@@ -451,24 +500,35 @@ def generate_questions():
         user_id = get_jwt_identity()
 
         if not prompt:
-            return jsonify({"error": "Prompt is required"}), 400
+            return jsonify({
+                "error": "Prompt is required. Please provide a detailed prompt including subject and question type."
+            }), 400
 
-        # Extract subject from prompt
+        # Extract subject and question type
         subject = extract_subject(prompt)
+        question_type = extract_question_type(prompt)
+
+        if not question_type:
+            return jsonify({
+                "error": "Question type not specified. Please include one of: multiple choice (MCQ), true/false, short answer, coding, or essay in your prompt."
+            }), 400
 
         formatted_prompt = f"""
-        Generate a set of exam questions for the subject '{subject}' based on the prompt:
+        Generate {question_type.upper()} questions for the subject '{subject}' based on the prompt:
         '{prompt}'
+
+        Follow these strict rules for the {question_type} type:
+
+        {get_question_type_rules(question_type)}
 
         Each question must be a dictionary with:
         - 'id': unique question ID
-        - 'question': question text
-        - 'type': one of ('mcq', 'true_false', 'short_answer', 'coding', 'essay')
-        - 'options': list of possible answers (only for 'mcq' and 'true_false')
-        - 'correct_answer': correct answer text (except for 'coding' and 'essay')
-        - 'hint': a short hint for the question
+        - 'question': clear, well-formed question text
+        - 'type': "{question_type}"
+        {get_type_specific_fields(question_type)}
+        - 'hint': specific, helpful hint that guides without giving away the answer
         - 'time_limit': time in seconds (default {DEFAULT_TIME_LIMIT})
-        - 'subject': the specific subject or topic of this question
+        - 'subject': "{subject}"
 
         Format the response as a JSON array of question objects without Markdown formatting.
         """
@@ -476,7 +536,10 @@ def generate_questions():
         response = openai_client.chat.completions.create(
             model=os.getenv("DEPLOYMENT_NAME"),
             messages=[
-                {"role": "system", "content": "You are an expert exam question generator."},
+                {
+                    "role": "system", 
+                    "content": f"You are an expert {question_type} question generator. Generate only {question_type} questions following the specified format."
+                },
                 {"role": "user", "content": formatted_prompt}
             ],
             temperature=0.7,
@@ -487,42 +550,253 @@ def generate_questions():
         clean_json = re.sub(r"```json\n(.*?)\n```", r"\1", response_text, flags=re.DOTALL)
         questions_json = json.loads(clean_json)
 
-        if not isinstance(questions_json, list):
-            raise ValueError("Invalid JSON response from OpenAI.")
-
-        # Initialize question timing and ensure required fields
-        question_start_times[user_id] = {
-            str(q.get("id", "")): time.time() 
-            for q in questions_json
-        }
-
-        # Verify subject from generated questions
-        questions_text = " ".join([
-            q.get("question", "") + " " + 
-            q.get("correct_answer", "") + " " + 
-            " ".join(q.get("options", []))
-            for q in questions_json
-        ])
-        verified_subject = extract_subject(questions_text)
-        
-        # Use the more specific subject between prompt and questions
-        final_subject = verified_subject if verified_subject != "General" else subject
-
-        # Add subject to each question
-        for question in questions_json:
-            question.setdefault("hint", "No hint available")
-            question.setdefault("time_limit", DEFAULT_TIME_LIMIT)
-            question["subject"] = final_subject
+        # Validate questions
+        validate_questions(questions_json, question_type)
 
         return jsonify({
             "questions": questions_json,
-            "subject": final_subject
+            "subject": subject,
+            "question_type": question_type
         })
 
     except json.JSONDecodeError:
         return jsonify({"error": "Invalid JSON format received from OpenAI"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+def get_question_type_rules(q_type: str) -> str:
+    """Get specific rules for each question type"""
+    rules = {
+        "mcq": """
+        - Each question must have exactly 4 distinct options
+        - One and only one correct answer
+        - Options should be plausible but clearly distinguishable
+        - Avoid "all of the above" or "none of the above" options
+        Example:
+        {
+            "id": 1,
+            "type": "mcq",
+            "question": "Which keyword is used to prevent a class from being inherited in Java?",
+            "options": ["final", "static", "private", "sealed"],
+            "correct_answer": "final",
+            "hint": "Think about class modifiers that restrict inheritance"
+        }
+        """,
+        
+        "true_false": """
+        - Question must be a complete, verifiable statement
+        - Must use ["True", "False"] as options
+        - Avoid negative statements
+        - Make statements specific and unambiguous
+        Example:
+        {
+            "id": 1,
+            "type": "true_false",
+            "question": "Java supports multiple inheritance through interfaces.",
+            "options": ["True", "False"],
+            "correct_answer": "True",
+            "hint": "Consider Java's inheritance and interface mechanisms"
+        }
+        """,
+        
+        "short_answer": """
+        - Question should require a specific, brief answer
+        - No options should be provided
+        - Correct answer should be clear and concise
+        - Avoid questions that could have multiple valid answers
+        Example:
+        {
+            "id": 1,
+            "type": "short_answer",
+            "question": "What Java keyword is used to define a constant variable?",
+            "correct_answer": "final",
+            "hint": "Think about variable modifiers that prevent value changes"
+        }
+        """
+    }
+    return rules.get(q_type, "Follow standard question format rules.")
+
+def get_type_specific_fields(q_type: str) -> str:
+    """Get required fields based on question type"""
+    fields = {
+        "mcq": """
+        - 'options': list of exactly 4 possible answers
+        - 'correct_answer': exact text matching one of the options""",
+        
+        "true_false": """
+        - 'options': ["True", "False"]
+        - 'correct_answer': either "True" or "False\"""",
+        
+        "short_answer": """
+        - 'correct_answer': the expected brief answer""",
+        
+        "coding": """
+        - 'correct_answer': sample solution code
+        - 'test_cases': list of input/output test cases""",
+        
+        "essay": """
+        - 'correct_answer': model answer or grading rubric"""
+    }
+    return fields.get(q_type, "")
+
+def validate_questions(questions: list, expected_type: str) -> None:
+    """Validate questions match the expected type and format"""
+    for question in questions:
+        if question.get("type") != expected_type:
+            raise ValueError(f"Question type mismatch. Expected {expected_type}, got {question.get('type')}")
+        
+        if expected_type == "mcq":
+            if not question.get("options") or len(question["options"]) != 4:
+                raise ValueError("MCQ questions must have exactly 4 options")
+        elif expected_type == "true_false":
+            if question.get("options") != ["True", "False"]:
+                question["options"] = ["True", "False"]
+        elif expected_type == "short_answer":
+            if "options" in question:
+                del question["options"]
+
+def get_question_examples(q_type: str, subject: str = None) -> dict:
+    """Get example questions and answers based on question type and subject"""
+    examples = {
+        "essay": {
+            "programming": [
+                {
+                    "question": "Explain the differences between REST and GraphQL APIs, including their advantages and disadvantages.",
+                    "correct_answer": """
+                    A comprehensive comparison of REST and GraphQL should include:
+
+                    1. Architecture:
+                    - REST: Resource-based with multiple endpoints
+                    - GraphQL: Single endpoint with query language
+
+                    2. Data Fetching:
+                    - REST: Multiple round trips for complex data
+                    - GraphQL: Single request for multiple resources
+
+                    3. Advantages of REST:
+                    - Caching capabilities
+                    - Widely adopted and understood
+                    - Better for simple CRUD operations
+
+                    4. Advantages of GraphQL:
+                    - Flexible data fetching
+                    - Reduced over-fetching
+                    - Strong typing system
+
+                    5. Use cases for each
+                    6. Performance considerations
+                    """,
+                    "rubric": {
+                        "understanding": 30,
+                        "completeness": 25,
+                        "examples": 20,
+                        "analysis": 25
+                    }
+                }
+            ],
+            "general": [
+                {
+                    "question": "Discuss the impact of artificial intelligence on modern society.",
+                    "correct_answer": """
+                    Key points to cover:
+                    1. Economic impact (automation, job market changes)
+                    2. Social implications (privacy, social interaction)
+                    3. Ethical considerations
+                    4. Future prospects and challenges
+                    5. Current applications and their effects
+                    """,
+                    "rubric": {
+                        "critical_thinking": 30,
+                        "evidence": 25,
+                        "structure": 25,
+                        "conclusion": 20
+                    }
+                }
+            ]
+        },
+        "short_answer": {
+            "programming": [
+                {
+                    "question": "What is the purpose of the 'static' keyword in Java?",
+                    "correct_answer": "To declare members that belong to the class rather than instances",
+                    "explanation": "The static keyword indicates class-level scope rather than instance-level"
+                },
+                {
+                    "question": "What does SOLID stand for in object-oriented design?",
+                    "correct_answer": "Single responsibility, Open-closed, Liskov substitution, Interface segregation, Dependency inversion",
+                    "explanation": "These are the five basic principles of object-oriented programming and design"
+                }
+            ],
+            "mathematics": [
+                {
+                    "question": "What is the derivative of e^x?",
+                    "correct_answer": "e^x",
+                    "explanation": "The exponential function is its own derivative"
+                }
+            ]
+        },
+        "coding": {
+            "python": [
+                {
+                    "question": "Write a function that returns the fibonacci sequence up to n numbers",
+                    "correct_answer": """
+                    def fibonacci(n):
+                        sequence = [0, 1]
+                        while len(sequence) < n:
+                            sequence.append(sequence[-1] + sequence[-2])
+                        return sequence[:n]
+                    """,
+                    "test_cases": [
+                        {"input": "5", "output": "[0, 1, 1, 2, 3]"},
+                        {"input": "3", "output": "[0, 1, 1]"}
+                    ],
+                    "evaluation_criteria": {
+                        "correctness": 40,
+                        "efficiency": 30,
+                        "style": 15,
+                        "documentation": 15
+                    }
+                }
+            ],
+            "javascript": [
+                {
+                    "question": "Write a function to deep clone an object in JavaScript",
+                    "correct_answer": """
+                    function deepClone(obj) {
+                        if (obj === null || typeof obj !== 'object') {
+                            return obj;
+                        }
+                        
+                        const clone = Array.isArray(obj) ? [] : {};
+                        
+                        for (let key in obj) {
+                            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                                clone[key] = deepClone(obj[key]);
+                            }
+                        }
+                        
+                        return clone;
+                    }
+                    """,
+                    "test_cases": [
+                        {
+                            "input": "{ a: 1, b: { c: 2 } }",
+                            "output": "{ a: 1, b: { c: 2 } }"
+                        }
+                    ],
+                    "evaluation_criteria": {
+                        "correctness": 40,
+                        "handling_edge_cases": 30,
+                        "performance": 30
+                    }
+                }
+            ]
+        }
+    }
+    
+    if subject and q_type in examples:
+        return examples[q_type].get(subject.lower(), examples[q_type].get("general", []))
+    return examples.get(q_type, [])
 
 def evaluate_essay(question: str, correct_answer: str, user_answer: str) -> dict:
     """Evaluate essay answers using OpenAI"""
@@ -541,8 +815,8 @@ def evaluate_essay(question: str, correct_answer: str, user_answer: str) -> dict
     Return a JSON with:
     - Individual scores for each criterion
     - Overall score (weighted average)
-    - Feedback comments
-    - Suggested improvements
+    - Specific feedback for improvement
+    - Key points covered and missed
     """
 
     try:
@@ -555,68 +829,55 @@ def evaluate_essay(question: str, correct_answer: str, user_answer: str) -> dict
             temperature=0.3,
             max_tokens=500
         )
-
+        
         evaluation = json.loads(response.choices[0].message.content)
         return evaluation
-
     except Exception as e:
-        print(f"Error evaluating essay: {str(e)}")
         return {
-            "content_score": 0,
-            "accuracy_score": 0,
-            "clarity_score": 0,
-            "grammar_score": 0,
+            "error": f"Evaluation failed: {str(e)}",
             "overall_score": 0,
-            "feedback": "Error evaluating essay",
-            "improvements": []
+            "feedback": "Automatic evaluation failed. Please review manually."
         }
 
 def evaluate_code(question: str, correct_answer: str, user_answer: str) -> dict:
-    """Evaluate coding answers using OpenAI"""
+    """Evaluate coding answers"""
     prompt = f"""
-    Evaluate this code solution based on the following criteria:
-    Problem: {question}
+    Evaluate this code solution based on the following:
+    Question: {question}
     Model Solution: {correct_answer}
     Student's Solution: {user_answer}
 
-    Please analyze:
+    Analyze:
     1. Correctness (0-100)
     2. Code efficiency (0-100)
     3. Code style and readability (0-100)
-    4. Best practices (0-100)
+    4. Error handling (0-100)
 
     Return a JSON with:
-    - Individual scores for each criterion
-    - Overall score (weighted average)
-    - Feedback comments
-    - Code improvements
-    - Any potential bugs or issues
+    - Scores for each criterion
+    - Overall score
+    - Specific feedback
+    - Suggested improvements
     """
 
     try:
         response = openai_client.chat.completions.create(
             model=os.getenv("DEPLOYMENT_NAME"),
             messages=[
-                {"role": "system", "content": "You are an expert code evaluator."},
+                {"role": "system", "content": "You are an expert code reviewer."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
             max_tokens=500
         )
-
+        
         evaluation = json.loads(response.choices[0].message.content)
         return evaluation
-
     except Exception as e:
-        print(f"Error evaluating code: {str(e)}")
         return {
-            "correctness_score": 0,
-            "efficiency_score": 0,
-            "style_score": 0,
-            "practices_score": 0,
+            "error": f"Evaluation failed: {str(e)}",
             "overall_score": 0,
-            "feedback": "Error evaluating code",
-            "improvements": []
+            "feedback": "Automatic evaluation failed. Please review manually."
         }
 
 @app.route("/validate_answers", methods=["POST"])
